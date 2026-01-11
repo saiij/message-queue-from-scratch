@@ -9,10 +9,10 @@ type Broker struct {
 	queue      *Queue
 	inFlight   map[string]*InFlight
 	mu         sync.RWMutex
-	ackTimeout time.Time
+	ackTimeout time.Duration
 }
 
-func NewBroker(q *Queue, ackTimeout time.Time) *Broker {
+func NewBroker(q *Queue, ackTimeout time.Duration) *Broker {
 	return &Broker{
 		queue:      q,
 		inFlight:   make(map[string]*InFlight),
@@ -22,26 +22,50 @@ func NewBroker(q *Queue, ackTimeout time.Time) *Broker {
 
 func (b *Broker) Consume() *Delivery {
 	msg := b.queue.Consume()
-	inFlightMsg := NewInFlight(msg, b.ackTimeout)
-	b.inFlight[msg.ID] = inFlightMsg
 
-	delivery := NewDelivery(msg, b.ack(msg.ID), b.nack(msg.ID))
+	deadline := time.Now().Add(b.ackTimeout)
+	b.mu.Lock()
+	inFlightMsg := NewInFlight(msg, deadline)
+	b.inFlight[msg.ID] = inFlightMsg
+	b.mu.Unlock()
+	delivery := NewDelivery(
+		msg,
+		func() {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+
+			if _, ok := b.inFlight[msg.ID]; !ok {
+				return
+			}
+			delete(b.inFlight, msg.ID)
+		},
+		func() {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+
+			inflight, ok := b.inFlight[msg.ID]
+			if !ok {
+				return
+			}
+			delete(b.inFlight, msg.ID)
+			b.queue.Publish(inflight.msg)
+		},
+	)
 
 	return delivery
 }
 
-// ack() -> esto es para proceso exitoso
-func (b *Broker) ack(id string) {
-	delete(b.inFlight, id)
-}
-
-// nack() -> proceso no exitoso , requeue y quitar del map
-func (b *Broker) nack(id string) {
-	message, ok := b.inFlight[id]
-	if !ok {
-		return
+func (b *Broker) watchInFlight() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	for range ticker.C {
+		now := time.Now()
+		b.mu.Lock()
+		for id, inflight := range b.inFlight {
+			if now.After(inflight.deadline) {
+				delete(b.inFlight, id)
+				b.queue.Publish(inflight.msg)
+			}
+		}
+		b.mu.Unlock()
 	}
-
-	b.queue.Publish(message.msg)
-	delete(b.inFlight, id)
 }
