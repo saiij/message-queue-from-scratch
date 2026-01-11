@@ -26,6 +26,13 @@ type InFlight struct {
 	deadline time.Time
 }
 
+func NewConsumer(id string) *Consumer {
+	return &Consumer{
+		id:        id,
+		deliverCh: make(chan *Delivery, 10),
+	}
+}
+
 func NewDelivery(m *Message, ackFn, nackFn func()) *Delivery {
 	return &Delivery{
 		Message: m,
