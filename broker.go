@@ -56,7 +56,7 @@ func (b *Broker) Consume() *Delivery {
 }
 
 func (b *Broker) watchInFlight() {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(10 * time.Millisecond)
 	for range ticker.C {
 		now := time.Now()
 		b.mu.Lock()

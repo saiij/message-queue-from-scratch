@@ -2,6 +2,19 @@ package main
 
 import "time"
 
+type Consumer struct {
+	id        string
+	deliverCh chan *Delivery
+}
+
+/*
+* registrar consumer :
+* 1 channel por consumer
+* dispatcher :
+* espera mensaje -> elige consumer -> dispatch
+*
+* */
+
 type Delivery struct {
 	Message *Message
 	Ack     func()
