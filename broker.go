@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -12,30 +13,52 @@ type Broker struct {
 	mu         sync.RWMutex
 	consumers  []*Consumer
 	ackTimeout time.Duration
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 func NewBroker(q *Queue, ackTimeout time.Duration) *Broker {
-	return &Broker{
+	ctx, cancel := context.WithCancel(context.Background())
+	b := &Broker{
 		queue:      q,
 		inFlight:   make(map[string]*InFlight),
 		ackTimeout: ackTimeout,
 		consumers:  []*Consumer{},
 		next:       0,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
+
+	// iniciar goroutines
+	b.wg.Add(2)
+	go b.watchInFlight()
+	go b.dispatch()
+
+	return b
 }
 
 func (b *Broker) watchInFlight() {
-	ticker := time.NewTicker(10 * time.Millisecond)
-	for range ticker.C {
-		now := time.Now()
-		b.mu.Lock()
-		for id, inflight := range b.inFlight {
-			if now.After(inflight.deadline) {
-				delete(b.inFlight, id)
-				b.queue.Publish(inflight.msg)
+	defer b.wg.Done()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			b.mu.Lock()
+			for id, inflight := range b.inFlight {
+				if now.After(inflight.deadline) {
+					delete(b.inFlight, id)
+					// reintetnar publicar ( ignora error si queue esta cerrada)
+					_ = b.queue.Publish(inflight.msg)
+				}
 			}
+			b.mu.Unlock()
 		}
-		b.mu.Unlock()
 	}
 }
 
@@ -48,50 +71,63 @@ func (b *Broker) RegisterConsumer(id string) <-chan *Delivery {
 }
 
 func (b *Broker) dispatch() {
+	defer b.wg.Done()
+
 	for {
-		msg := b.queue.Consume()
+		select {
+		case <-b.ctx.Done():
+			return
+		default:
+			msg, ok := b.queue.Consume()
+			if !ok {
+				// Queue cerrada
+				return
+			}
 
-		b.mu.Lock()
-		//	for len(b.consumers) == 0 {
-		//		b.mu.Unlock()
-		//		time.Sleep(10 * time.Millisecond)
-		//		b.mu.Lock()
-		//	}
+			b.mu.Lock()
+			// Esperar si no hay consumers
+			if len(b.consumers) == 0 {
+				b.mu.Unlock()
+				// Re-publicar mensaje
+				_ = b.queue.Publish(msg)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
 
-		consumer := b.nextConsumer()
+			consumer := b.nextConsumer()
+			deadline := time.Now().Add(b.ackTimeout)
+			b.inFlight[msg.ID] = &InFlight{
+				msg:      msg,
+				deadline: deadline,
+			}
+			b.mu.Unlock()
 
-		deadline := time.Now().Add(b.ackTimeout)
-		b.inFlight[msg.ID] = &InFlight{
-			msg:      msg,
-			deadline: deadline,
+			delivery := NewDelivery(
+				msg,
+				func() {
+					b.mu.Lock()
+					defer b.mu.Unlock()
+					delete(b.inFlight, msg.ID)
+				},
+				func() {
+					b.mu.Lock()
+					defer b.mu.Unlock()
+					inflight, ok := b.inFlight[msg.ID]
+					if !ok {
+						return
+					}
+					delete(b.inFlight, msg.ID)
+					_ = b.queue.Publish(inflight.msg)
+				},
+			)
+
+			// Envio no bloqueante
+			select {
+			case consumer.deliverCh <- delivery:
+			case <-b.ctx.Done():
+				return
+			}
 		}
-		b.mu.Unlock()
-
-		delivery := NewDelivery(
-			msg,
-			func() {
-				b.mu.Lock()
-				defer b.mu.Unlock()
-
-				if _, ok := b.inFlight[msg.ID]; !ok {
-					return
-				}
-				delete(b.inFlight, msg.ID)
-			},
-			func() {
-				b.mu.Lock()
-				defer b.mu.Unlock()
-
-				inflight, ok := b.inFlight[msg.ID]
-				if !ok {
-					return
-				}
-				delete(b.inFlight, msg.ID)
-				b.queue.Publish(inflight.msg)
-			},
-		)
-
-		consumer.deliverCh <- delivery
 	}
 }
 
@@ -99,4 +135,16 @@ func (b *Broker) nextConsumer() *Consumer {
 	consumer := b.consumers[b.next]
 	b.next = (b.next + 1) % len(b.consumers)
 	return consumer
+}
+
+func (b *Broker) Shutdwon() {
+	b.cancel()
+	b.wg.Wait()
+
+	// cerrar channels
+	b.mu.Lock()
+	for _, c := range b.consumers {
+		close(c.deliverCh)
+	}
+	b.mu.Unlock()
 }
